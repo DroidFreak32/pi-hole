@@ -82,7 +82,6 @@ PI_HOLE_FILES=(chronometer list piholeDebug piholeLogFlush setupLCD update versi
 PI_HOLE_INSTALL_DIR="/opt/pihole"
 PI_HOLE_CONFIG_DIR="/etc/pihole"
 PI_HOLE_BIN_DIR="/usr/local/bin"
-PI_HOLE_404_DIR="${webroot}/pihole"
 FTL_CONFIG_FILE="${PI_HOLE_CONFIG_DIR}/pihole-FTL.conf"
 if [ -z "$useUpdateVars" ]; then
     useUpdateVars=false
@@ -1380,37 +1379,96 @@ installConfigs() {
         fi
     fi
 
-    # Install pihole-FTL.service
-    install -T -m 0755 "${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole-FTL.service" "/etc/init.d/pihole-FTL"
+    # Install pihole-FTL systemd or init.d service, based on whether systemd is the init system or not
+    # Follow debhelper logic, which checks for /run/systemd/system to derive whether systemd is the init system
+    if [[ -d '/run/systemd/system' ]]; then
+        install -T -m 0644 "${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole-FTL.systemd" '/etc/systemd/system/pihole-FTL.service'
+
+        # Remove init.d service if present
+        if [[ -e '/etc/init.d/pihole-FTL' ]]; then
+            rm '/etc/init.d/pihole-FTL'
+            update-rc.d pihole-FTL remove
+        fi
+
+        # Load final service
+        systemctl daemon-reload
+    else
+        install -T -m 0755 "${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole-FTL.service" '/etc/init.d/pihole-FTL'
+    fi
+    install -T -m 0755 "${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole-FTL-prestart.sh" "${PI_HOLE_INSTALL_DIR}/pihole-FTL-prestart.sh"
+    install -T -m 0755 "${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole-FTL-poststop.sh" "${PI_HOLE_INSTALL_DIR}/pihole-FTL-poststop.sh"
 
     # If the user chose to install the dashboard,
     if [[ "${INSTALL_WEB_SERVER}" == true ]]; then
-        # and if the Web server conf directory does not exist,
-        if [[ ! -d "/etc/lighttpd" ]]; then
-            # make it and set the owners
-            install -d -m 755 -o "${USER}" -g root /etc/lighttpd
-        # Otherwise, if the config file already exists
-        elif [[ -f "${lighttpdConfig}" ]]; then
-            # back up the original
-            mv "${lighttpdConfig}"{,.orig}
-        fi
-        # and copy in the config file Pi-hole needs
-        install -D -m 644 -T ${PI_HOLE_LOCAL_REPO}/advanced/${LIGHTTPD_CFG} "${lighttpdConfig}"
-        # Make sure the external.conf file exists, as lighttpd v1.4.50 crashes without it
-        if [ ! -f /etc/lighttpd/external.conf ]; then
-            install -m 644 /dev/null /etc/lighttpd/external.conf
-        fi
-        # If there is a custom block page in the html/pihole directory, replace 404 handler in lighttpd config
-        if [[ -f "${PI_HOLE_404_DIR}/custom.php" ]]; then
-            sed -i 's/^\(server\.error-handler-404\s*=\s*\).*$/\1"\/pihole\/custom\.php"/' "${lighttpdConfig}"
-        fi
-        # Make the directories if they do not exist and set the owners
+        # set permissions on /etc/lighttpd/lighttpd.conf so pihole user (other) can read the file
+        chmod o+x /etc/lighttpd
+        chmod o+r "${lighttpdConfig}"
+
+        # Ensure /run/lighttpd exists and is owned by lighttpd user
+        # Needed for the php socket
         mkdir -p /run/lighttpd
         chown ${LIGHTTPD_USER}:${LIGHTTPD_GROUP} /run/lighttpd
-        mkdir -p /var/cache/lighttpd/compress
-        chown ${LIGHTTPD_USER}:${LIGHTTPD_GROUP} /var/cache/lighttpd/compress
-        mkdir -p /var/cache/lighttpd/uploads
-        chown ${LIGHTTPD_USER}:${LIGHTTPD_GROUP} /var/cache/lighttpd/uploads
+
+        if grep -q -F "FILE AUTOMATICALLY OVERWRITTEN BY PI-HOLE" "${lighttpdConfig}"; then
+            # Attempt to preserve backwards compatibility with older versions
+            install -D -m 644 -T ${PI_HOLE_LOCAL_REPO}/advanced/${LIGHTTPD_CFG} "${lighttpdConfig}"
+            # Make the directories if they do not exist and set the owners
+            mkdir -p /var/cache/lighttpd/compress
+            chown ${LIGHTTPD_USER}:${LIGHTTPD_GROUP} /var/cache/lighttpd/compress
+            mkdir -p /var/cache/lighttpd/uploads
+            chown ${LIGHTTPD_USER}:${LIGHTTPD_GROUP} /var/cache/lighttpd/uploads
+        fi
+        # Copy the config file to include for pihole admin interface
+        if [[ -d "/etc/lighttpd/conf.d" ]]; then
+            install -D -m 644 -T ${PI_HOLE_LOCAL_REPO}/advanced/pihole-admin.conf /etc/lighttpd/conf.d/pihole-admin.conf
+            if grep -q -F 'include "/etc/lighttpd/conf.d/pihole-admin.conf"' "${lighttpdConfig}"; then
+                :
+            else
+                echo 'include "/etc/lighttpd/conf.d/pihole-admin.conf"' >> "${lighttpdConfig}"
+            fi
+            # Avoid some warnings trace from lighttpd, which might break tests
+            conf=/etc/lighttpd/conf.d/pihole-admin.conf
+            if lighttpd -f "${lighttpdConfig}" -tt 2>&1 | grep -q -F "WARNING: unknown config-key: dir-listing\."; then
+                echo '# Avoid some warnings trace from lighttpd, which might break tests' >> $conf
+                echo 'server.modules += ( "mod_dirlisting" )' >> $conf
+            fi
+            if lighttpd -f "${lighttpdConfig}" -tt 2>&1 | grep -q -F "warning: please use server.use-ipv6"; then
+                echo '# Avoid some warnings trace from lighttpd, which might break tests' >> $conf
+                echo 'server.use-ipv6 := "disable"' >> $conf
+            fi
+        elif [[ -d "/etc/lighttpd/conf-available" ]]; then
+            conf=/etc/lighttpd/conf-available/15-pihole-admin.conf
+            install -D -m 644 -T ${PI_HOLE_LOCAL_REPO}/advanced/pihole-admin.conf $conf
+
+            # Get the version number of lighttpd
+            version=$(dpkg-query -f='${Version}\n' --show lighttpd)
+            # Test if that version is greater than or euqal to 1.4.56
+            if dpkg --compare-versions "$version" "ge" "1.4.56"; then
+                # If it is, then we don't need to disable the modules
+                # (server.modules duplication is ignored in lighttpd 1.4.56+)
+                :
+            else
+                # disable server.modules += ( ... ) in $conf to avoid module dups
+                if awk '!/^server\.modules/{print}' $conf > $conf.$$ && mv $conf.$$ $conf; then
+                :
+                else
+                    rm $conf.$$
+                fi
+            fi
+
+            chmod 644 $conf
+            if is_command lighty-enable-mod ; then
+                lighty-enable-mod pihole-admin access accesslog redirect fastcgi setenv > /dev/null || true
+            else
+                # Otherwise, show info about installing them
+                printf "  %b Warning: 'lighty-enable-mod' utility not found\\n" "${INFO}"
+                printf "      Please ensure fastcgi is enabled if you experience issues\\n"
+            fi
+        else
+            # lighttpd config include dir not found
+            printf "  %b Warning: lighttpd config include dir not found\\n" "${INFO}"
+            printf "      Please manually install pihole-admin.conf\\n"
+        fi
     fi
 }
 
@@ -1661,30 +1719,6 @@ install_dependent_packages() {
 
 # Install the Web interface dashboard
 installPiholeWeb() {
-    printf "\\n  %b Installing 404 page...\\n" "${INFO}"
-
-    local str="Creating directory for 404 page, and copying files"
-    printf "  %b %s..." "${INFO}" "${str}"
-    # Install the directory
-    install -d -m 0755 ${PI_HOLE_404_DIR}
-    # and the 404 handler
-    install -D -m 644 ${PI_HOLE_LOCAL_REPO}/advanced/index.php ${PI_HOLE_404_DIR}/
-
-    printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
-
-    local str="Backing up index.lighttpd.html"
-    printf "  %b %s..." "${INFO}" "${str}"
-    # If the default index file exists,
-    if [[ -f "${webroot}/index.lighttpd.html" ]]; then
-        # back it up
-        mv ${webroot}/index.lighttpd.html ${webroot}/index.lighttpd.orig
-        printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
-    else
-        # Otherwise, don't do anything
-        printf "%b  %b %s\\n" "${OVER}" "${INFO}" "${str}"
-        printf "      No default index.lighttpd.html file found... not backing up\\n"
-    fi
-
     # Install Sudoers file
     local str="Installing sudoer file"
     printf "\\n  %b %s..." "${INFO}" "${str}"
@@ -1760,20 +1794,35 @@ create_pihole_user() {
     else
         # If the pihole user doesn't exist,
         printf "%b  %b %s" "${OVER}" "${CROSS}" "${str}"
-        local str="Creating user 'pihole'"
-        printf "%b  %b %s..." "${OVER}" "${INFO}" "${str}"
-        # create her with the useradd command,
+        local str="Checking for group 'pihole'"
+        printf "  %b %s..." "${INFO}" "${str}"
         if getent group pihole > /dev/null 2>&1; then
-            # then add her to the pihole group (as it already exists)
+            # group pihole exists
+            printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
+            # then create and add her to the pihole group
+            local str="Creating user 'pihole'"
+            printf "%b  %b %s..." "${OVER}" "${INFO}" "${str}"
             if useradd -r --no-user-group -g pihole -s /usr/sbin/nologin pihole; then
                 printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
             else
                 printf "%b  %b %s\\n" "${OVER}" "${CROSS}" "${str}"
             fi
         else
-            # add user pihole with default group settings
-            if useradd -r -s /usr/sbin/nologin pihole; then
+            # group pihole does not exist
+            printf "%b  %b %s\\n" "${OVER}" "${CROSS}" "${str}"
+            local str="Creating group 'pihole'"
+            # if group can be created
+            if groupadd pihole; then
                 printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
+                # create and add pihole user to the pihole group
+                local str="Creating user 'pihole'"
+                printf "%b  %b %s..." "${OVER}" "${INFO}" "${str}"
+                if useradd -r --no-user-group -g pihole -s /usr/sbin/nologin pihole; then
+                    printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
+                else
+                    printf "%b  %b %s\\n" "${OVER}" "${CROSS}" "${str}"
+                fi
+
             else
                 printf "%b  %b %s\\n" "${OVER}" "${CROSS}" "${str}"
             fi
@@ -1872,15 +1921,6 @@ installPihole() {
             # Give lighttpd access to the pihole group so the web interface can
             # manage the gravity.db database
             usermod -a -G pihole ${LIGHTTPD_USER}
-            # If the lighttpd command is executable,
-            if is_command lighty-enable-mod ; then
-                # enable fastcgi and fastcgi-php
-                lighty-enable-mod fastcgi fastcgi-php > /dev/null || true
-            else
-                # Otherwise, show info about installing them
-                printf "  %b Warning: 'lighty-enable-mod' utility not found\\n" "${INFO}"
-                printf "      Please ensure fastcgi is enabled if you experience issues\\n"
-            fi
         fi
     fi
     # Install base files and web interface
